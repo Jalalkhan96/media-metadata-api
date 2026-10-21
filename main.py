@@ -76,6 +76,11 @@ _YDL_OPTS = {
     "socket_timeout": 15,
     "retries": 1,
     "extract_flat": False,
+    # YouTube bot-checks many datacenter IPs on the default web client;
+    # the mobile/app clients usually still serve public metadata.
+    "extractor_args": {
+        "youtube": {"player_client": ["android", "web"]}
+    },
 }
 
 
