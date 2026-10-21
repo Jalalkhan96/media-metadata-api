@@ -11,10 +11,12 @@ URLs. All `url` fields inside format entries are stripped on purpose.
 """
 
 import asyncio
+import json
 import os
 import secrets
+import urllib.request
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
@@ -182,6 +184,61 @@ def sanitize_search_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Official oEmbed fallback (YouTube / TikTok)
+#
+# Both platforms block full metadata extraction from most datacenter IPs
+# ("Sign in to confirm you're not a bot"). Their official oEmbed endpoints
+# still serve basic public metadata — title, author, thumbnail — with no
+# login and no cookies. Used only when full extraction fails.
+# ---------------------------------------------------------------------------
+
+_OEMBED_HOSTS = (
+    (("youtube.com", "youtu.be"), "youtube",
+     "https://www.youtube.com/oembed?url={q}&format=json"),
+    (("tiktok.com",), "tiktok",
+     "https://www.tiktok.com/oembed?url={q}"),
+)
+
+
+def _oembed_sync(url: str) -> Optional[dict[str, Any]]:
+    host = (urlparse(url).netloc or "").lower()
+    endpoint = platform = None
+    for hosts, plat, tpl in _OEMBED_HOSTS:
+        if any(h in host for h in hosts):
+            endpoint, platform = tpl.format(q=quote(url, safe="")), plat
+            break
+    if not endpoint:
+        return None
+    req = urllib.request.Request(
+        endpoint, headers={"User-Agent": "Mozilla/5.0 (media-metadata-api)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    out = {
+        "type": "video",
+        "platform": platform,
+        "title": data.get("title"),
+        "uploader": data.get("author_name"),
+        "channel": data.get("author_name"),
+        "channel_url": data.get("author_url"),
+        "thumbnail": data.get("thumbnail_url"),
+        "width": data.get("thumbnail_width"),
+        "height": data.get("thumbnail_height"),
+        "source_url": url,
+        "metadata_source": "official-oembed",
+        "note": "Platform blocks full metadata from this server's IP range; "
+        "basic metadata served by the platform's official oEmbed endpoint.",
+    }
+    cleaned = {k: v for k, v in out.items() if v is not None}
+    if not (cleaned.get("title") or cleaned.get("thumbnail")):
+        return None
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -223,6 +280,9 @@ async def _do_info(url: str) -> dict[str, Any]:
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Metadata lookup timed out.")
         except Exception as exc:  # yt-dlp raises DownloadError and friends
+            fallback = await asyncio.to_thread(_oembed_sync, url)
+            if fallback:
+                return fallback
             raise HTTPException(
                 status_code=422,
                 detail=f"Could not read metadata for this URL: {exc.__class__.__name__}: {str(exc)[:300]}",
